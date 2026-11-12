@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>كرة الصوت</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Tajawal:wght@500;800&display=swap">
+<style>
+:root{--sky1:#101a3a;--sky2:#3a2a6b;--ground:#5ad1a8;--ink:#f4f1ff;--ball:#ffd166;--panel:rgba(16,26,58,.88);color-scheme:dark;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html,body{height:100%;margin:0;background:var(--sky1);color:var(--ink);font-family:"Tajawal",system-ui,sans-serif;overflow:hidden}
+canvas{display:block;width:100%;height:100%}
+#hud{position:fixed;top:env(safe-area-inset-top,0px);left:0;right:0;display:flex;justify-content:space-between;padding:14px 18px;font-weight:800;font-size:26px;pointer-events:none}
+#hud small{font-size:15px;font-weight:500;opacity:.75;display:block}
+#meter{position:fixed;bottom:calc(14px + env(safe-area-inset-bottom,0px));left:18px;right:18px;display:flex;align-items:center;gap:12px;font-size:14px}
+#bar{position:relative;flex:1;height:12px;border-radius:6px;background:rgba(255,255,255,.15);overflow:hidden;direction:ltr}
+#fill{height:100%;width:0;background:var(--ground)}
+.t{position:absolute;top:0;bottom:0;width:2px;background:#fff}
+#sens{width:90px}
+#ov{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(10,14,34,.6)}
+#box{background:var(--panel);border-radius:18px;padding:26px 24px;text-align:center;max-width:320px;line-height:1.7}
+h1{margin:0 0 8px;font-size:28px}
+p{margin:6px 0;font-size:16px}
+button{margin-top:14px;font:inherit;font-weight:800;font-size:18px;padding:12px 34px;border:0;border-radius:12px;background:var(--ball);color:#1a1530;cursor:pointer}
+button:focus-visible{outline:3px solid #fff;outline-offset:3px}
+#err{color:#ff9aa8;font-size:14px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><div><small>الحفر اللي عدّيتها</small><span id="n">0</span></div><div style="text-align:left"><small>أفضل نتيجة</small><span id="best">0</span></div></div>
+<div id="meter"><span>الصوت</span><div id="bar"><div id="fill"></div><div class="t" id="tw"></div><div class="t" id="tj"></div></div><input id="sens" type="range" min="0.5" max="2.5" step="0.1" value="1" aria-label="الحساسية"></div>
+<div id="ov"><div id="box">
+<h1>كرة الصوت</h1>
+<p>تكلّم بصوت عادي: تمشي الكرة.<br>ارفع صوتك: تقفز فوق الحفرة.</p>
+<p id="err"></p>
+<button id="go">ابدأ</button>
+</div></div>
+<script>
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const $=id=>document.getElementById(id);
+let W,H,D;
+function resize(){D=window.devicePixelRatio||1;W=innerWidth;H=innerHeight;cv.width=W*D;cv.height=H*D;ctx.setTransform(D,0,0,D,0,0)}
+addEventListener('resize',resize);resize();
+
+let best=0;try{best=+localStorage.getItem('vb_best')||0}catch(e){}
+$('best').textContent=best;
+
+// ---- microphone ----
+let analyser,buf,lvl=0,ambient=0.01,micOn=false,calibUntil=0,calibSum=0,calibN=0;
+async function startMic(){
+  const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false}});
+  const ac=new (window.AudioContext||window.webkitAudioContext)();
+  await ac.resume();
+  analyser=ac.createAnalyser();analyser.fftSize=1024;
+  ac.createMediaStreamSource(stream).connect(analyser);
+  buf=new Float32Array(analyser.fftSize);micOn=true;
+  calibUntil=performance.now()+900;calibSum=0;calibN=0;
+}
+function readMic(){
+  if(!micOn)return;
+  analyser.getFloatTimeDomainData(buf);
+  let s=0;for(let i=0;i<buf.length;i++)s+=buf[i]*buf[i];
+  const rms=Math.sqrt(s/buf.length);
+  lvl=lvl*0.6+rms*0.4;
+  if(performance.now()<calibUntil){calibSum+=rms;calibN++;ambient=Math.max(0.004,calibSum/calibN)}
+}
+function thresholds(){
+  const k=+$('sens').value;
+  const walk=(ambient*2.5+0.012)/k, jump=(ambient*3+0.07)/k*1.0;
+  return {walk,jump:Math.max(jump,walk*2)};
+}
+
+// ---- keyboard / tap fallback ----
+let keyWalk=false,keyJump=false;
+addEventListener('keydown',e=>{if(e.code==='Space'||e.code==='ArrowUp')keyJump=true;if(e.code==='ArrowRight'||e.code==='ArrowLeft')keyWalk=true});
+addEventListener('keyup',e=>{if(e.code==='Space'||e.code==='ArrowUp')keyJump=false;if(e.code==='ArrowRight'||e.code==='ArrowLeft')keyWalk=false});
+
+// ---- game state ----
+const R=20,SPEED=200,G=1800,JV=-700;
+let falling=false,worldX,y,vy,onGround,count,holes,nextHole,state='idle',angle,jumpCd;
+function reset(){
+  worldX=0;y=gy()-R;vy=0;onGround=true;falling=false;count=0;holes=[];nextHole=700;angle=0;jumpCd=0;
+  $('n').textContent=0;state='play';
+}
+function gy(){return Math.round(H*0.68)}
+function spawn(){
+  while(nextHole<worldX+W+400){
+    const w=70+Math.random()*40;
+    holes.push({x:nextHole,w,done:false});
+    nextHole+=w+380+Math.random()*260;
+  }
+  holes=holes.filter(h=>h.x+h.w>worldX-200);
+}
+const px=()=>W*0.28; // ball screen x
+
+let last=performance.now();
+function frame(now){
+  const dt=Math.min(0.033,(now-last)/1000);last=now;
+  readMic();
+  const th=thresholds();
+  if(state==='play'){
+    const loud=(micOn&&lvl>th.jump)||keyJump;
+    const talk=(micOn&&lvl>th.walk)||keyWalk||loud;
+    jumpCd-=dt;
+    const base=gy()-R;
+    if(!falling&&onGround&&loud&&jumpCd<=0){vy=JV;onGround=false;jumpCd=0.25}
+    if(!falling&&(talk||!onGround))worldX+=SPEED*dt,angle+=SPEED*dt/R;
+    spawn();
+    const bx=worldX+px();
+    vy+=G*dt;y+=vy*dt;
+    const over=holes.some(h=>bx>h.x+R*0.4&&bx<h.x+h.w-R*0.4);
+    if(!falling&&y>=base&&vy>=0){
+      if(over){if(y>base+R*0.6)falling=true;onGround=false}
+      else{y=base;vy=0;onGround=true}
+    } else onGround=false;
+    for(const h of holes){if(!h.done&&bx>h.x+h.w+R*0.4&&!falling&&y<=base+1){h.done=true;count++;$('n').textContent=count}}
+    if(y>H+60){endGame()}
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+function endGame(){
+  state='over';
+  if(count>best){best=count;$('best').textContent=best;try{localStorage.setItem('vb_best',best)}catch(e){}}
+  $('box').innerHTML='<h1>سقطت في حفرة!</h1><p>عدّيت <b>'+count+'</b> '+(count===1?'حفرة':'حفر')+'</p><button id="go">العب مرة ثانية</button>';
+  $('go').onclick=begin;$('ov').style.display='flex';
+}
+function begin(){reset();$('ov').style.display='none'}
+
+function draw(){
+  const g=ctx.createLinearGradient(0,0,0,H);g.addColorStop(0,'#101a3a');g.addColorStop(1,'#3a2a6b');
+  ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+  // far stars
+  ctx.fillStyle='rgba(255,255,255,.55)';
+  for(let i=0;i<40;i++){const sx=((i*173-(worldX||0)*0.1)%W+W)%W,sy=(i*97)%(gy()-40);ctx.fillRect(sx,sy,2,2)}
+  const G0=gy(),wx=worldX||0;
+  // ground segments
+  ctx.fillStyle='#5ad1a8';
+  let cur=wx-10;
+  const hs=(holes||[]).filter(h=>h.x+h.w>wx-10&&h.x<wx+W+10).sort((a,b)=>a.x-b.x);
+  for(const h of hs){
+    if(h.x>cur)ctx.fillRect(cur-wx,G0,h.x-cur,H-G0);
+    cur=Math.max(cur,h.x+h.w);
+  }
+  ctx.fillRect(cur-wx,G0,wx+W+10-cur,H-G0);
+  // grass top
+  ctx.fillStyle='#3fae87';
+  cur=wx-10;
+  for(const h of hs){if(h.x>cur)ctx.fillRect(cur-wx,G0,h.x-cur,6);cur=Math.max(cur,h.x+h.w)}
+  ctx.fillRect(cur-wx,G0,wx+W+10-cur,6);
+  // ball
+  const bx=px();
+  const cy=state==='idle'?G0-R:y;
+  ctx.save();ctx.translate(bx,cy);ctx.rotate(angle||0);
+  ctx.fillStyle='#ffd166';ctx.beginPath();ctx.arc(0,0,R,0,7);ctx.fill();
+  ctx.fillStyle='#1a1530';ctx.beginPath();ctx.arc(R*0.45,-R*0.2,3.2,0,7);ctx.fill();
+  ctx.strokeStyle='#1a1530';ctx.lineWidth=2.5;ctx.beginPath();ctx.arc(0,0,R-5,0.3,1.5);ctx.stroke();
+  ctx.restore();
+  // meter
+  const th=thresholds(),max=th.jump*1.6;
+  $('fill').style.width=Math.min(100,lvl/max*100)+'%';
+  $('fill').style.background=lvl>th.jump?'#ffd166':(lvl>th.walk?'#5ad1a8':'#8a86b8');
+  $('tw').style.left=(th.walk/max*100)+'%';$('tj').style.left=(th.jump/max*100)+'%';
+}
+
+let tried=false;
+$('go').onclick=async()=>{
+  if(tried&&!micOn){begin();return}
+  tried=true;
+  try{
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)throw new Error('المتصفح هنا ما يدعم المايك');
+    const pp=document.permissionsPolicy||document.featurePolicy;
+    if(pp&&pp.allowsFeature&&!pp.allowsFeature('microphone'))throw new Error('هذه الصفحة محجوب عنها المايك من المكان اللي تفتحها فيه');
+    await startMic();$('err').textContent='';begin();
+  }catch(e){
+    $('err').textContent='ما اشتغل المايك ('+(e.name||'')+' '+(e.message||'')+'). جرّب تفتح الرابط في Chrome أو Safari مباشرة وتسمح للمايك.';
+    $('go').textContent='العب بدون مايك (اضغط الشاشة للمشي)';
+  }
+};
+// لمس الشاشة كبديل: ضغط = مشي، ضغط في النصف الأعلى = قفز
+addEventListener('pointerdown',e=>{if($('ov').style.display==='none'&&!micOn){keyWalk=true;if(e.clientY<innerHeight/2)keyJump=true}});
+addEventListener('pointerup',()=>{if(!micOn){keyWalk=false;keyJump=false}});
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
